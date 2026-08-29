@@ -1,0 +1,39 @@
+{
+  "name": "rn-arch-check",
+  "version": "1.0.0",
+  "description": "Static analyzer for React Native New Architecture compatibility",
+  "main": "dist/index.js",
+  "bin": {
+    "rn-arch-check": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build",
+    "scan": "ts-node src/index.ts"
+  },
+  "keywords": [
+    "react-native",
+    "new-architecture",
+    "turbomodules",
+    "fabric",
+    "bridgeless",
+    "cli"
+  ],
+  "license": "MIT",
+  "files": [
+    "dist"
+  ],
+  "dependencies": {
+    "chalk": "^4.1.2",
+    "cli-table3": "^0.6.5",
+    "commander": "^12.1.0",
+    "fast-glob": "^3.3.2",
+    "fs-extra": "^11.2.0"
+  },
+  "devDependencies": {
+    "@types/fs-extra": "^11.0.4",
+    "@types/node": "^20.14.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.4.5"
+  }
+}
