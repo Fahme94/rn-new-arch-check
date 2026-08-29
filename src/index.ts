@@ -43,10 +43,11 @@ program
       const readyReports = reports.filter((r) => r.status === "FULL_SUPPORT");
       const untestedReports = reports.filter((r) => r.status === "UNKNOWN_NATIVE");
       const pureJsReports = reports.filter((r) => r.status === "PURE_JS");
+      const page16KBIssues = reports.filter((r) => r.pageSize16KB && !r.pageSize16KB.isCompatible);
 
       const totalNative = nativeReports.length;
       const readyPercentage = totalNative > 0 ? Math.round((readyReports.length / totalNative) * 100) : 100;
-      const isFullyCompatible = legacyReports.length === 0;
+      const isFullyCompatible = legacyReports.length === 0 && page16KBIssues.length === 0;
 
       if (options.json) {
         const output = {
@@ -66,6 +67,7 @@ program
             legacy: legacyReports.length,
             untested: untestedReports.length,
             pureJs: pureJsReports.length,
+            pageSize16KBIssues: page16KBIssues.length,
             compatibilityScore: readyPercentage,
             isCompatible: isFullyCompatible,
           },
@@ -74,7 +76,6 @@ program
         console.log(JSON.stringify(output, null, 2));
       } else {
         // Project Header Card
-        const divider = chalk.gray("─".repeat(78));
         console.log("\n" + chalk.bold.cyan("┌" + "─".repeat(76) + "┐"));
         console.log(
           chalk.bold.cyan("│") +
@@ -144,7 +145,10 @@ program
           const techDetails = rep.notes.length > 0 ? rep.notes.join(", ") : "-";
 
           let migrationAdvice = chalk.gray("-");
-          if (rep.suggestion) {
+          if (rep.pageSize16KB && !rep.pageSize16KB.isCompatible) {
+            const warningText = rep.pageSize16KB.warnings.join("\n");
+            migrationAdvice = `${chalk.red.bold("⚠️ 16KB Page Size Warning:")}\n${chalk.gray(warningText)}`;
+          } else if (rep.suggestion) {
             migrationAdvice = `${chalk.yellow.bold("💡 " + rep.suggestion)}`;
             if (rep.reason) {
               migrationAdvice += `\n${chalk.gray(rep.reason)}`;
@@ -167,15 +171,16 @@ program
 
         // Breakdown Summary
         console.log("\n" + chalk.bold("📊 Dependency Breakdown:"));
-        console.log(`  ${chalk.green("✔")} New Architecture Ready:  ${chalk.green.bold(readyReports.length)}`);
-        console.log(`  ${chalk.red("✖")} Legacy Bridge (Blocking): ${chalk.red.bold(legacyReports.length)}`);
+        console.log(`  ${chalk.green("✔")} New Architecture Ready:   ${chalk.green.bold(readyReports.length)}`);
+        console.log(`  ${chalk.red("✖")} Legacy Bridge (Blocking):  ${chalk.red.bold(legacyReports.length)}`);
         if (untestedReports.length > 0) {
-          console.log(`  ${chalk.yellow("?")} Untested Native Modules:  ${chalk.yellow.bold(untestedReports.length)}`);
+          console.log(`  ${chalk.yellow("?")} Untested Native Modules:   ${chalk.yellow.bold(untestedReports.length)}`);
         }
-        console.log(`  ${chalk.blue("○")} Pure JS/TS Packages:      ${chalk.blue.bold(pureJsReports.length)}`);
-        console.log(`  📦 Total Packages Scanned:     ${chalk.bold(reports.length)}`);
+        console.log(`  ${chalk.blue("○")} Pure JS/TS Packages:       ${chalk.blue.bold(pureJsReports.length)}`);
+        console.log(`  📱 16KB Page Size (Android 15): ${page16KBIssues.length === 0 ? chalk.green.bold("✔ All Aligned") : chalk.red.bold(`✖ ${page16KBIssues.length} Warning(s)`)}`);
+        console.log(`  📦 Total Packages Scanned:      ${chalk.bold(reports.length)}`);
 
-        // Actionable Checklist
+        // Actionable Checklist for New Architecture
         if (legacyReports.length > 0) {
           console.log("\n" + chalk.red.bold("🚨 Action Required to Enable New Architecture:"));
           legacyReports.forEach((pkg, index) => {
@@ -183,12 +188,24 @@ program
             console.log(`  ${index + 1}. ${chalk.bold.white(pkg.name)}: ${advice}`);
           });
           console.log();
-        } else {
-          console.log(chalk.green.bold("\n🚀 Congratulations! All native dependencies are ready for New Architecture & Bridgeless Mode!\n"));
+        }
+
+        // Actionable Checklist for 16KB Page Size Issues
+        if (page16KBIssues.length > 0) {
+          console.log(chalk.red.bold("⚠️ 16KB Page Size Compatibility Issues (Google Play / Android 15):"));
+          page16KBIssues.forEach((pkg, index) => {
+            console.log(`  ${index + 1}. ${chalk.bold.white(pkg.name)}:`);
+            pkg.pageSize16KB?.warnings.forEach((w) => console.log(`     - ${chalk.yellow(w)}`));
+          });
+          console.log();
+        }
+
+        if (legacyReports.length === 0 && page16KBIssues.length === 0) {
+          console.log(chalk.green.bold("\n🚀 Congratulations! All native dependencies are ready for New Architecture, Bridgeless Mode & 16KB Android Page Sizes!\n"));
         }
       }
 
-      if (options.strict && legacyReports.length > 0) {
+      if (options.strict && (legacyReports.length > 0 || page16KBIssues.length > 0)) {
         process.exit(1);
       }
     } catch (err: any) {

@@ -2,6 +2,7 @@ import fs from "fs-extra";
 import path from "path";
 import fg from "fast-glob";
 import { getSuggestion } from "./replacements";
+import { checkPackage16KB, PageSize16KBReport } from "./elf";
 
 export type ArchStatus = "PURE_JS" | "FULL_SUPPORT" | "LEGACY_BRIDGE" | "UNKNOWN_NATIVE";
 
@@ -17,6 +18,7 @@ export interface PackageReport {
   isExpoModule: boolean;
   platforms: ("iOS" | "Android" | "C++")[];
   status: ArchStatus;
+  pageSize16KB?: PageSize16KBReport;
   suggestion?: string;
   reason?: string;
   notes: string[];
@@ -153,6 +155,11 @@ export async function inspectPackage(
       notes.push("Legacy Bridge");
     }
 
+    const pageSize16KB = await checkPackage16KB(pkgDir);
+    if (!pageSize16KB.isCompatible) {
+      notes.push("16KB Page Size Warning");
+    }
+
     const suggestionInfo = getSuggestion(pkgName);
 
     return {
@@ -167,6 +174,7 @@ export async function inspectPackage(
       isExpoModule,
       platforms,
       status,
+      pageSize16KB,
       suggestion: suggestionInfo?.replacement,
       reason: suggestionInfo?.reason,
       notes,

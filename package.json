@@ -1,6 +1,6 @@
 {
   "name": "rn-new-arck-check",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Static analyzer for React Native New Architecture compatibility",
   "main": "dist/index.js",
   "bin": {
