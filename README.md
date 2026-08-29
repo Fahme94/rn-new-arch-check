@@ -1,15 +1,15 @@
-# rn-arch-check
+# rn-new-arck-check
 
 CLI static analyzer to check if your React Native dependencies support the **New Architecture (TurboModules & Fabric)** and **Bridgeless Mode**.
 
 ## Installation
 
 ```bash
-npm install -g rn-arch-check
+npm install -g rn-new-arck-check
 # or run directly with npx:
-npx rn-arch-check
+npx rn-new-arck-check
 # or with yarn:
-yarn rn-arch-check
+yarn global add rn-new-arck-check
 ```
 
 ## Features
@@ -36,15 +36,15 @@ yarn rn-arch-check
 
 ```bash
 # Scan a specific React Native project
-rn-arch-check -p /path/to/my-rn-app
+npx rn-new-arck-check -p /path/to/my-rn-app
 
 # Deep scan of transitive dependencies
-rn-arch-check -p /path/to/my-rn-app -d
+npx rn-new-arck-check -p /path/to/my-rn-app -d
 
 # Strict mode for CI/CD checks
-rn-arch-check -p /path/to/my-rn-app --strict
+npx rn-new-arck-check -p /path/to/my-rn-app --strict
 
 # Export JSON report
-rn-arch-check -p /path/to/my-rn-app --json > rn-arch-report.json
+npx rn-new-arck-check -p /path/to/my-rn-app --json > rn-arch-report.json
 ```
 

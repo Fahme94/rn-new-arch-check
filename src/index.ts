@@ -16,7 +16,7 @@ function renderProgressBar(percentage: number, length = 24): string {
 }
 
 program
-  .name("rn-arch-check")
+  .name("rn-new-arck-check")
   .description("Static analyzer for React Native New Architecture compatibility")
   .option("-p, --path <path>", "Path to React Native project root", process.cwd())
   .option("-d, --deep", "Perform deep recursive scan for transitive dependencies", false)
