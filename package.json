@@ -20,6 +20,14 @@
     "cli"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Fahme94/rn-arch-check.git"
+  },
+  "homepage": "https://github.com/Fahme94/rn-arch-check#readme",
+  "bugs": {
+    "url": "https://github.com/Fahme94/rn-arch-check/issues"
+  },
   "files": [
     "dist"
   ],
