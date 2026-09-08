@@ -1,6 +1,6 @@
 {
   "name": "rn-new-arck-check",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Static analyzer for React Native New Architecture compatibility",
   "main": "dist/index.js",
   "bin": {
@@ -10,6 +10,8 @@
   },
   "scripts": {
     "build": "tsc",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.test.json",
+    "test": "node -r ts-node/register --test tests/*.test.ts",
     "prepublishOnly": "npm run build",
     "scan": "ts-node src/index.ts"
   },
@@ -38,12 +40,17 @@
     "cli-table3": "^0.6.5",
     "commander": "^12.1.0",
     "fast-glob": "^3.3.2",
-    "fs-extra": "^11.2.0"
+    "fs-extra": "^11.2.0",
+    "yauzl": "^3.4.0"
   },
   "devDependencies": {
     "@types/fs-extra": "^11.0.4",
     "@types/node": "^20.14.0",
+    "@types/yauzl": "^2.10.3",
     "ts-node": "^10.9.2",
     "typescript": "^5.4.5"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }
