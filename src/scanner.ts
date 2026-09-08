@@ -1,26 +1,45 @@
 import fs from "fs-extra";
 import path from "path";
 import fg from "fast-glob";
-import { getSuggestion } from "./replacements";
+import { Advice, getAdvice } from "./replacements";
 import { checkPackage16KB, PageSize16KBReport } from "./elf";
+import { inspectProject, ProjectInfo } from "./project";
+import { resolveDeclaredDependencies } from "./resolve";
+import {
+  Confidence,
+  NATIVE_FILE_EXTENSIONS,
+  Platform,
+  classify,
+  collectEvidence,
+  commentStyleFor,
+  detectPlatform,
+  emptyEvidence,
+} from "./detect";
 
-export type ArchStatus = "PURE_JS" | "FULL_SUPPORT" | "LEGACY_BRIDGE" | "UNKNOWN_NATIVE";
+export type ArchStatus =
+  | "PURE_JS"
+  | "FULL_SUPPORT"
+  | "LEGACY_BRIDGE"
+  | "UNKNOWN_NATIVE"
+  /** Declared in package.json but not found on disk, so nothing could be checked. */
+  | "UNRESOLVED";
 
 export interface PackageReport {
   name: string;
   version: string;
-  packagePath: string;
+  packagePath: string | null;
   isTransitive: boolean;
   hasNativeCode: boolean;
   hasCodegenConfig: boolean;
   hasTurboModule: boolean;
   hasFabric: boolean;
   isExpoModule: boolean;
-  platforms: ("iOS" | "Android" | "C++")[];
+  platforms: Platform[];
   status: ArchStatus;
+  /** How trustworthy the classification is. See `detect.ts`. */
+  confidence: Confidence;
   pageSize16KB?: PageSize16KBReport;
-  suggestion?: string;
-  reason?: string;
+  advice?: Advice;
   notes: string[];
 }
 
@@ -30,13 +49,27 @@ export interface ScanOptions {
 }
 
 export interface ScanResult {
-  projectName: string;
-  projectVersion: string;
-  reactNativeVersion: string;
-  reactVersion?: string;
-  expoVersion?: string;
+  project: ProjectInfo;
   projectRoot: string;
+  scanMode: "direct" | "deep";
   reports: PackageReport[];
+}
+
+const NATIVE_GLOB = `**/*.{${NATIVE_FILE_EXTENSIONS.join(",")}}`;
+
+const NATIVE_SCAN_IGNORE = [
+  "**/node_modules/**",
+  "**/example/**",
+  "**/examples/**",
+  "**/build/**",
+  "**/android/build/**",
+];
+
+/** Packages that describe the platform itself rather than a dependency on it. */
+const SKIPPED_PACKAGES = new Set(["react", "react-native"]);
+
+function isSkipped(pkgName: string): boolean {
+  return SKIPPED_PACKAGES.has(pkgName) || pkgName.startsWith("@types/");
 }
 
 export async function inspectPackage(
@@ -44,30 +77,24 @@ export async function inspectPackage(
   isTransitive = false
 ): Promise<PackageReport | null> {
   const pkgJsonPath = path.join(pkgDir, "package.json");
-  if (!await fs.pathExists(pkgJsonPath)) return null;
+  if (!(await fs.pathExists(pkgJsonPath))) return null;
 
   try {
     const pkgJson = await fs.readJson(pkgJsonPath);
-    const pkgName = pkgJson.name || path.basename(pkgDir);
-    const pkgVersion = pkgJson.version || "0.0.0";
+    const pkgName: string = pkgJson.name || path.basename(pkgDir);
+    const pkgVersion: string = pkgJson.version || "0.0.0";
 
-    if (pkgName.startsWith("@types/") || pkgName === "react" || pkgName === "react-native") {
-      return null;
-    }
+    if (isSkipped(pkgName)) return null;
 
-    const notes: string[] = [];
     const hasCodegenConfig = Boolean(pkgJson.codegenConfig);
-    const expoConfigPath = path.join(pkgDir, "expo-module.config.json");
-    const isExpoModule = await fs.pathExists(expoConfigPath);
+    const isExpoModule = await fs.pathExists(path.join(pkgDir, "expo-module.config.json"));
 
-    const nativeFiles = await fg(["**/*.{podspec,java,kt,mm,m,cpp,hpp,h,gradle}"], {
+    const nativeFiles = await fg([NATIVE_GLOB], {
       cwd: pkgDir,
-      ignore: ["**/node_modules/**", "**/example/**", "**/examples/**", "**/build/**", "**/android/build/**"],
+      ignore: NATIVE_SCAN_IGNORE,
     });
 
-    const hasNativeCode = nativeFiles.length > 0 || isExpoModule;
-
-    if (!hasNativeCode) {
+    if (nativeFiles.length === 0 && !isExpoModule) {
       return {
         name: pkgName,
         version: pkgVersion,
@@ -80,103 +107,53 @@ export async function inspectPackage(
         isExpoModule: false,
         platforms: [],
         status: "PURE_JS",
+        confidence: "structural",
         notes: ["Pure JS/TS"],
       };
     }
 
-    const platformSet = new Set<"iOS" | "Android" | "C++">();
-    let hasTurboModule = false;
-    let hasFabric = false;
-    let usesLegacyBridge = false;
-
-    if (isExpoModule) {
-      notes.push("Expo Module");
-    }
+    const platformSet = new Set<Platform>();
+    const evidence = emptyEvidence();
 
     for (const relativeFilePath of nativeFiles) {
-      const lower = relativeFilePath.toLowerCase();
-      if (lower.endsWith(".podspec") || lower.endsWith(".mm") || lower.endsWith(".m") || lower.includes("/ios/") || lower.startsWith("ios/")) {
-        platformSet.add("iOS");
-      }
-      if (lower.endsWith(".java") || lower.endsWith(".kt") || lower.endsWith(".gradle") || lower.includes("/android/") || lower.startsWith("android/")) {
-        platformSet.add("Android");
-      }
-      if (lower.endsWith(".cpp") || lower.endsWith(".hpp") || lower.includes("/cpp/") || lower.startsWith("cpp/")) {
-        platformSet.add("C++");
+      for (const platform of detectPlatform(relativeFilePath)) {
+        platformSet.add(platform);
       }
 
-      // Check code contents for architecture indicators
-      if (lower.endsWith(".podspec") || lower.endsWith(".java") || lower.endsWith(".kt") || lower.endsWith(".mm") || lower.endsWith(".cpp") || lower.endsWith(".h")) {
-        try {
-          const fullPath = path.join(pkgDir, relativeFilePath);
-          const content = await fs.readFile(fullPath, "utf8");
+      const style = commentStyleFor(relativeFilePath);
+      if (!style) continue;
 
-          if (
-            content.includes("RCTTurboModule") ||
-            content.includes("TurboReactPackage") ||
-            content.includes("TurboModule") ||
-            (content.includes("ReactContextBaseJavaModule") && content.includes("Spec"))
-          ) {
-            hasTurboModule = true;
-          }
-
-          if (
-            content.includes("RCTComponentViewProtocol") ||
-            content.includes("ConcreteComponentDescriptor") ||
-            content.includes("ViewComponentDescriptor") ||
-            content.includes("Fabric")
-          ) {
-            hasFabric = true;
-          }
-
-          if (
-            (content.includes("RCTBridgeModule") && !content.includes("RCTTurboModule")) ||
-            (content.includes("extends ReactContextBaseJavaModule") && !content.includes("Turbo"))
-          ) {
-            usesLegacyBridge = true;
-          }
-        } catch {
-          // Ignore read errors
-        }
+      try {
+        const content = await fs.readFile(path.join(pkgDir, relativeFilePath), "utf8");
+        collectEvidence(content, style, evidence);
+      } catch {
+        // Ignore read errors
       }
     }
 
-    const platforms = Array.from(platformSet);
-
-    let status: ArchStatus = "UNKNOWN_NATIVE";
-
-    if (hasCodegenConfig || hasTurboModule || hasFabric || isExpoModule) {
-      status = "FULL_SUPPORT";
-      if (hasCodegenConfig) notes.push("Codegen");
-      if (hasTurboModule) notes.push("TurboModule");
-      if (hasFabric) notes.push("Fabric View");
-    } else if (usesLegacyBridge) {
-      status = "LEGACY_BRIDGE";
-      notes.push("Legacy Bridge");
-    }
+    const { status, confidence, notes } = classify(
+      { hasCodegenConfig, isExpoModule },
+      evidence
+    );
 
     const pageSize16KB = await checkPackage16KB(pkgDir);
-    if (!pageSize16KB.isCompatible) {
-      notes.push("16KB Page Size Warning");
-    }
-
-    const suggestionInfo = getSuggestion(pkgName);
+    if (!pageSize16KB.isCompatible) notes.push("16KB Page Size Warning");
 
     return {
       name: pkgName,
       version: pkgVersion,
       packagePath: pkgDir,
       isTransitive,
-      hasNativeCode,
+      hasNativeCode: true,
       hasCodegenConfig,
-      hasTurboModule,
-      hasFabric,
+      hasTurboModule: evidence.turboModule,
+      hasFabric: evidence.fabric,
       isExpoModule,
-      platforms,
+      platforms: Array.from(platformSet),
       status,
+      confidence,
       pageSize16KB,
-      suggestion: suggestionInfo?.replacement,
-      reason: suggestionInfo?.reason,
+      advice: getAdvice(pkgName, pkgVersion),
       notes,
     };
   } catch {
@@ -184,74 +161,122 @@ export async function inspectPackage(
   }
 }
 
+function unresolvedReport(name: string, spec: string): PackageReport {
+  return {
+    name,
+    version: spec,
+    packagePath: null,
+    isTransitive: false,
+    hasNativeCode: false,
+    hasCodegenConfig: false,
+    hasTurboModule: false,
+    hasFabric: false,
+    isExpoModule: false,
+    platforms: [],
+    status: "UNRESOLVED",
+    confidence: "none",
+    notes: ["Declared but not installed"],
+    advice: getAdvice(name, null),
+  };
+}
+
+/**
+ * Directories that are a package root, i.e. `node_modules/<name>` or
+ * `node_modules/@scope/<name>`.
+ *
+ * A bare `**\/package.json` glob also matches manifests that packages ship
+ * inside their own subdirectories (`dist/package.json`, used to set
+ * `"type": "module"`), which were previously reported as separate transitive
+ * dependencies and inflated the totals the verdict is derived from.
+ */
+function isPackageRoot(pkgDir: string): boolean {
+  const parent = path.basename(path.dirname(pkgDir));
+  if (parent === "node_modules") return true;
+
+  const grandparent = path.basename(path.dirname(path.dirname(pkgDir)));
+  return parent.startsWith("@") && grandparent === "node_modules";
+}
+
+async function scanDeep(
+  projectRoot: string,
+  directNames: Set<string>
+): Promise<PackageReport[]> {
+  const manifests = await fg(["**/node_modules/**/package.json"], {
+    cwd: projectRoot,
+    ignore: ["**/example/**", "**/examples/**"],
+    absolute: true,
+  });
+
+  const reports: PackageReport[] = [];
+  const seenDirs = new Set<string>();
+  const seenPackages = new Set<string>();
+
+  for (const manifestPath of manifests) {
+    const pkgDir = path.dirname(manifestPath);
+    if (seenDirs.has(pkgDir) || !isPackageRoot(pkgDir)) continue;
+    seenDirs.add(pkgDir);
+
+    const report = await inspectPackage(pkgDir, true);
+    if (!report) continue;
+
+    // A hoisted package can appear at several depths; report it once.
+    const identity = `${report.name}@${report.version}`;
+    if (seenPackages.has(identity)) continue;
+    seenPackages.add(identity);
+
+    report.isTransitive = !directNames.has(report.name);
+    reports.push(report);
+  }
+
+  return reports;
+}
+
 export async function scanProject(options: ScanOptions): Promise<ScanResult> {
   const { projectRoot, deepScan } = options;
-  const rootPkgJsonPath = path.join(projectRoot, "package.json");
-  const nodeModulesPath = path.join(projectRoot, "node_modules");
 
-  if (!await fs.pathExists(rootPkgJsonPath)) {
+  if (!(await fs.pathExists(path.join(projectRoot, "package.json")))) {
     throw new Error("package.json not found in project root.");
   }
 
-  const rootPkgJson = await fs.readJson(rootPkgJsonPath);
-  const directDeps = new Set([
-    ...Object.keys(rootPkgJson.dependencies || {}),
-    ...Object.keys(rootPkgJson.devDependencies || {}),
-  ]);
+  const project = await inspectProject(projectRoot);
+  const pkgJson = await fs.readJson(path.join(projectRoot, "package.json"));
+  const specs: Record<string, string> = {
+    ...(pkgJson.dependencies ?? {}),
+    ...(pkgJson.devDependencies ?? {}),
+  };
 
-  const projectName = rootPkgJson.name || path.basename(projectRoot);
-  const projectVersion = rootPkgJson.version || "1.0.0";
-  const reactNativeVersion =
-    rootPkgJson.dependencies?.["react-native"] ||
-    rootPkgJson.devDependencies?.["react-native"] ||
-    "Not detected";
-  const reactVersion =
-    rootPkgJson.dependencies?.["react"] ||
-    rootPkgJson.devDependencies?.["react"];
-  const expoVersion =
-    rootPkgJson.dependencies?.["expo"] ||
-    rootPkgJson.devDependencies?.["expo"];
+  const declared = await resolveDeclaredDependencies(projectRoot, specs);
+  const directNames = new Set(declared.map((dependency) => dependency.name));
 
   const reports: PackageReport[] = [];
-  const processedPaths = new Set<string>();
+
+  // Declared dependencies are always accounted for, whether or not they are
+  // installed, so an absent node_modules cannot pass as a clean project.
+  for (const dependency of declared) {
+    if (isSkipped(dependency.name)) continue;
+
+    if (!dependency.dir) {
+      reports.push(unresolvedReport(dependency.name, dependency.spec));
+      continue;
+    }
+
+    const report = await inspectPackage(dependency.dir, false);
+    if (report) reports.push(report);
+  }
 
   if (deepScan) {
-    const allPkgJsons = await fg(["**/node_modules/**/package.json"], {
-      cwd: projectRoot,
-      ignore: ["**/example/**", "**/examples/**"],
-      absolute: true,
-    });
-
-    for (const pkgJsonPath of allPkgJsons) {
-      const pkgDir = path.dirname(pkgJsonPath);
-      if (processedPaths.has(pkgDir)) continue;
-      processedPaths.add(pkgDir);
-
-      const dirName = path.basename(pkgDir);
-      const parentDirName = path.basename(path.dirname(pkgDir));
-      const pkgName = parentDirName.startsWith("@") ? `${parentDirName}/${dirName}` : dirName;
-
-      const isTransitive = !directDeps.has(pkgName);
-      const report = await inspectPackage(pkgDir, isTransitive);
-      if (report) reports.push(report);
-    }
-  } else {
-    for (const depName of directDeps) {
-      const depDir = path.join(nodeModulesPath, depName);
-      if (await fs.pathExists(depDir)) {
-        const report = await inspectPackage(depDir, false);
-        if (report) reports.push(report);
-      }
+    const seen = new Set(reports.map((report) => `${report.name}@${report.version}`));
+    for (const report of await scanDeep(projectRoot, directNames)) {
+      if (seen.has(`${report.name}@${report.version}`)) continue;
+      seen.add(`${report.name}@${report.version}`);
+      reports.push(report);
     }
   }
 
   return {
-    projectName,
-    projectVersion,
-    reactNativeVersion,
-    reactVersion,
-    expoVersion,
+    project,
     projectRoot,
+    scanMode: deepScan ? "deep" : "direct",
     reports,
   };
 }

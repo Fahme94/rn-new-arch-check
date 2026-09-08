@@ -3,212 +3,416 @@ import { Command } from "commander";
 import chalk from "chalk";
 import Table from "cli-table3";
 import path from "path";
-import { scanProject } from "./scanner";
+import { scanProject, PackageReport, ArchStatus } from "./scanner";
+import { ProjectInfo } from "./project";
+import { ADVICE_LAST_REVIEWED, Advice, formatAdvice } from "./replacements";
+import {
+  FAIL_CATEGORIES,
+  STRICT_CATEGORIES,
+  Summary,
+  Verdict,
+  gateFailures,
+  parseFailCategories,
+  summarize,
+} from "./verdict";
 
-const program = new Command();
+const LABEL_WIDTH = 17;
 
-function renderProgressBar(percentage: number, length = 24): string {
+function renderProgressBar(percentage: number | null, length = 24): string {
+  if (percentage === null) {
+    return `[${chalk.gray("░".repeat(length))}] ${chalk.gray("n/a")}`;
+  }
   const filledLength = Math.round((length * percentage) / 100);
-  const emptyLength = length - filledLength;
   const filled = chalk.green("█".repeat(filledLength));
-  const empty = chalk.gray("░".repeat(emptyLength));
+  const empty = chalk.gray("░".repeat(length - filledLength));
   return `[${filled}${empty}] ${percentage}%`;
 }
+
+/**
+ * Pad the plain label before colouring it. Padding a coloured string counts the
+ * ANSI escape sequences as visible characters, which is what previously made the
+ * report header misalign.
+ */
+function field(label: string, value: string): string {
+  return `  ${chalk.gray(label.padEnd(LABEL_WIDTH))}${value}`;
+}
+
+const VERDICT_DISPLAY: Record<Verdict, { text: string; render: (s: string) => string }> = {
+  READY: { text: "✔ READY", render: (s) => chalk.green.bold(s) },
+  NEEDS_REVIEW: { text: "⚠ NEEDS REVIEW", render: (s) => chalk.yellow.bold(s) },
+  MIGRATION_REQUIRED: { text: "✖ MIGRATION REQUIRED", render: (s) => chalk.red.bold(s) },
+  INCOMPLETE: { text: "⚠ INCOMPLETE SCAN", render: (s) => chalk.magenta.bold(s) },
+};
+
+const STATUS_DISPLAY: Record<ArchStatus, string> = {
+  FULL_SUPPORT: chalk.green.bold("✔ Ready"),
+  LEGACY_BRIDGE: chalk.red.bold("✖ Legacy"),
+  UNKNOWN_NATIVE: chalk.yellow("? Unverified"),
+  PURE_JS: chalk.blue("○ Pure JS"),
+  UNRESOLVED: chalk.magenta.bold("⚠ Not installed"),
+};
+
+function printProjectHeader(project: ProjectInfo, projectRoot: string, scanMode: string): void {
+  console.log("\n" + chalk.bold.cyan("React Native architecture report"));
+  console.log();
+
+  console.log(field("Project", `${chalk.bold.yellow(project.name)} ${chalk.gray("v" + project.version)}`));
+
+  const rnValue = project.installedReactNative
+    ? chalk.bold.green(project.installedReactNative) +
+      (project.declaredReactNative
+        ? chalk.gray(`  (declared ${project.declaredReactNative})`)
+        : "")
+    : chalk.red("not installed") +
+      (project.declaredReactNative
+        ? chalk.gray(`  (declared ${project.declaredReactNative})`)
+        : "");
+  console.log(field("React Native", rnValue));
+
+  if (project.installedReact) console.log(field("React", project.installedReact));
+  if (project.installedExpo) console.log(field("Expo", chalk.magenta(project.installedExpo)));
+
+  const platforms = [
+    project.hasAndroidProject ? "android/" : null,
+    project.hasIosProject ? "ios/" : null,
+  ].filter(Boolean);
+  if (platforms.length > 0) console.log(field("Native projects", platforms.join("  ")));
+
+  console.log(field("Path", chalk.gray(projectRoot)));
+  console.log(field("Scan mode", scanMode === "deep" ? "direct + transitive" : "direct dependencies"));
+
+  console.log();
+  console.log(chalk.bold("  Architecture"));
+  if (project.notes.length === 0) {
+    console.log(`    ${chalk.gray("No architecture configuration found.")}`);
+  }
+  for (const note of project.notes) {
+    const marker = note.level === "warn" ? chalk.yellow("⚠") : chalk.green("✔");
+    console.log(`    ${marker} ${note.level === "warn" ? chalk.yellow(note.message) : note.message}`);
+  }
+}
+
+/** Advice worth showing: a real action the developer has not taken yet. */
+function actionableAdvice(report: PackageReport): Advice | undefined {
+  if (!report.advice || report.advice.satisfied) return undefined;
+  return report.advice;
+}
+
+function adviceCell(report: PackageReport): string {
+  if (report.pageSize16KB && !report.pageSize16KB.isCompatible) {
+    return `${chalk.red.bold("⚠ 16KB page size:")}\n${chalk.gray(report.pageSize16KB.warnings.join("\n"))}`;
+  }
+
+  if (report.status === "UNRESOLVED") {
+    return chalk.magenta("Install dependencies and re-run");
+  }
+
+  const advice = actionableAdvice(report);
+  if (advice) {
+    return `${chalk.yellow.bold("💡 " + formatAdvice(advice))}\n${chalk.gray(advice.reason)}`;
+  }
+
+  if (report.status === "FULL_SUPPORT") return chalk.green("✔ TurboModule / Fabric ready");
+  if (report.status === "UNKNOWN_NATIVE") {
+    return chalk.gray("No codegenConfig found; verify with the library docs");
+  }
+  return chalk.gray("-");
+}
+
+interface Column {
+  header: string;
+  /** Narrowest useful width. */
+  minWidth: number;
+  /** Share of the leftover width; 0 for columns of fixed size. */
+  share: number;
+  /** Dropped first when the terminal is too narrow for every column. */
+  optional?: boolean;
+  render: (report: PackageReport) => string;
+}
+
+const COLUMNS: Column[] = [
+  {
+    header: "Package & Version",
+    minWidth: 22,
+    share: 0.4,
+    render: (report) =>
+      `${chalk.bold(report.name)}\n${chalk.gray(
+        report.status === "UNRESOLVED" ? report.version : "v" + report.version
+      )}`,
+  },
+  {
+    header: "Type",
+    minWidth: 12,
+    share: 0,
+    optional: true,
+    render: (report) =>
+      report.isTransitive ? chalk.magenta("Transitive") : chalk.cyan("Direct"),
+  },
+  {
+    header: "Platforms",
+    minWidth: 14,
+    share: 0,
+    optional: true,
+    render: (report) =>
+      report.platforms.length > 0
+        ? report.platforms.map((platform) => chalk.cyan(`[${platform}]`)).join(" ")
+        : chalk.gray(report.status === "UNRESOLVED" ? "-" : "JS"),
+  },
+  {
+    header: "Status",
+    minWidth: 16,
+    share: 0,
+    render: (report) => STATUS_DISPLAY[report.status],
+  },
+  {
+    header: "Evidence",
+    minWidth: 14,
+    share: 0.22,
+    render: (report) => (report.notes.length > 0 ? report.notes.join(", ") : "-"),
+  },
+  {
+    header: "Action",
+    minWidth: 22,
+    share: 0.38,
+    render: adviceCell,
+  },
+];
+
+function buildTable(reports: PackageReport[]): string {
+  // `columns` is unset when output is piped, so fall back to COLUMNS (which CI
+  // logs commonly set) before assuming a width.
+  const detected = process.stdout.columns || Number(process.env.COLUMNS) || 120;
+  const available = Math.max(60, Math.min(detected, 160));
+
+  // Every column carries two border characters plus padding.
+  const overhead = (count: number) => count + 1 + count * 2;
+  const fits = (columns: Column[]) =>
+    columns.reduce((total, column) => total + column.minWidth, 0) + overhead(columns.length) <=
+    available;
+
+  const columns = fits(COLUMNS) ? COLUMNS : COLUMNS.filter((column) => !column.optional);
+
+  const fixedWidth = columns
+    .filter((column) => column.share === 0)
+    .reduce((total, column) => total + column.minWidth, 0);
+  const flexible = Math.max(0, available - fixedWidth - overhead(columns.length));
+  const totalShare = columns.reduce((total, column) => total + column.share, 0);
+
+  const widths = columns.map((column) =>
+    column.share === 0
+      ? column.minWidth
+      : Math.max(column.minWidth, Math.floor((flexible * column.share) / totalShare))
+  );
+
+  const table = new Table({
+    head: columns.map((column) => chalk.bold.white(column.header)),
+    colWidths: widths,
+    wordWrap: true,
+  });
+
+  for (const report of reports) {
+    table.push(columns.map((column) => column.render(report)));
+  }
+
+  return table.toString();
+}
+
+function printBreakdown(summary: Summary): void {
+  console.log("\n" + chalk.bold("📊 Dependency breakdown:"));
+  console.log(`  ${chalk.green("✔")} New Architecture ready:     ${chalk.green.bold(summary.ready)}`);
+  console.log(`  ${chalk.red("✖")} Legacy bridge:              ${chalk.red.bold(summary.legacy)}`);
+  console.log(`  ${chalk.yellow("?")} Unverified native:          ${chalk.yellow.bold(summary.unknown)}`);
+  console.log(`  ${chalk.blue("○")} Pure JS/TS:                 ${chalk.blue.bold(summary.pureJs)}`);
+  if (summary.unresolved > 0) {
+    console.log(`  ${chalk.magenta("⚠")} Declared but not installed: ${chalk.magenta.bold(summary.unresolved)}`);
+  }
+  console.log(
+    `  📱 16KB page size (Android):   ${
+      summary.pageSize16KBIssues === 0
+        ? chalk.green.bold("✔ all aligned")
+        : chalk.red.bold(`✖ ${summary.pageSize16KBIssues} warning(s)`)
+    }`
+  );
+  console.log(`  📦 Total packages:             ${chalk.bold(summary.totalScanned)}`);
+}
+
+function printActions(reports: PackageReport[], summary: Summary): void {
+  const unresolved = reports.filter((report) => report.status === "UNRESOLVED");
+  if (unresolved.length > 0) {
+    console.log("\n" + chalk.magenta.bold("⚠ Dependencies declared but not installed:"));
+    console.log(
+      chalk.gray(
+        "  These could not be inspected, so this scan is incomplete and proves nothing about compatibility."
+      )
+    );
+    unresolved.forEach((report, index) => {
+      console.log(`  ${index + 1}. ${chalk.bold.white(report.name)} ${chalk.gray(report.version)}`);
+    });
+  }
+
+  const legacy = reports.filter((report) => report.status === "LEGACY_BRIDGE");
+  if (legacy.length > 0) {
+    console.log("\n" + chalk.red.bold("🚨 Legacy bridge packages:"));
+    console.log(
+      chalk.gray(
+        "  These run through React Native's interop layer, which is enabled by default. They are frozen upstream (no fixes since 0.80) and are the packages to migrate first."
+      )
+    );
+    legacy.forEach((report, index) => {
+      const advice = actionableAdvice(report);
+      const text = advice
+        ? chalk.yellow(formatAdvice(advice))
+        : chalk.gray("Check the library repo for a TurboModule/Fabric release");
+      console.log(`  ${index + 1}. ${chalk.bold.white(report.name)}: ${text}`);
+    });
+  }
+
+  const unverified = reports.filter((report) => report.status === "UNKNOWN_NATIVE");
+  if (unverified.length > 0) {
+    console.log("\n" + chalk.yellow.bold("? Unverified native packages:"));
+    console.log(
+      chalk.gray(
+        "  Native code with no codegenConfig and no legacy markers. Not a failure -- these need a manual check."
+      )
+    );
+    unverified.forEach((report, index) => {
+      console.log(`  ${index + 1}. ${chalk.bold.white(report.name)} ${chalk.gray("v" + report.version)}`);
+    });
+  }
+
+  const pageSizeIssues = reports.filter(
+    (report) => report.pageSize16KB && !report.pageSize16KB.isCompatible
+  );
+  if (pageSizeIssues.length > 0) {
+    console.log("\n" + chalk.red.bold("⚠ 16KB page size issues (Google Play, Android 15+):"));
+    pageSizeIssues.forEach((report, index) => {
+      console.log(`  ${index + 1}. ${chalk.bold.white(report.name)}:`);
+      report.pageSize16KB?.warnings.forEach((warning) =>
+        console.log(`     - ${chalk.yellow(warning)}`)
+      );
+    });
+  }
+
+  if (summary.verdict === "READY") {
+    console.log(
+      "\n" +
+        chalk.green.bold(
+          "🚀 All native dependencies are verified ready for the New Architecture and 16KB Android page sizes.\n"
+        )
+    );
+  }
+}
+
+const program = new Command();
 
 program
   .name("rn-new-arck-check")
   .description("Static analyzer for React Native New Architecture compatibility")
   .option("-p, --path <path>", "Path to React Native project root", process.cwd())
   .option("-d, --deep", "Perform deep recursive scan for transitive dependencies", false)
-  .option("-s, --strict", "Exit with code 1 if any legacy or incompatible module is found", false)
-  .option("-a, --all", "Show all packages including pure JavaScript libraries in the table", false)
+  .option("-a, --all", "Show all packages including pure JavaScript libraries", false)
+  .option(
+    "-s, --strict",
+    `Exit 1 on findings in: ${STRICT_CATEGORIES.join(", ")} (shorthand for --fail-on)`,
+    false
+  )
+  .option(
+    "--fail-on <categories>",
+    `Comma-separated exit-1 conditions: ${FAIL_CATEGORIES.join(", ")}, all, none`
+  )
   .option("--json", "Output results in JSON format (useful for CI)", false)
   .action(async (options) => {
     const projectRoot = path.resolve(options.path);
 
+    let failCategories = options.strict ? [...STRICT_CATEGORIES] : [];
+    if (options.failOn !== undefined) {
+      const parsed = parseFailCategories(options.failOn);
+      if (parsed.invalid.length > 0) {
+        console.error(
+          chalk.red(
+            `\n✖ Unknown --fail-on value(s): ${parsed.invalid.join(", ")}. Valid: ${FAIL_CATEGORIES.join(", ")}, all, none`
+          )
+        );
+        process.exit(2);
+      }
+      failCategories = parsed.categories;
+    }
+
     try {
       if (!options.json) {
-        console.log(chalk.cyan.bold("\n🔍 Scanning React Native project for New Architecture compatibility..."));
+        console.log(
+          chalk.cyan("\n🔍 Scanning React Native project for New Architecture compatibility...")
+        );
       }
 
-      const result = await scanProject({
-        projectRoot,
-        deepScan: options.deep,
-      });
-
-      const { projectName, projectVersion, reactNativeVersion, reactVersion, expoVersion, reports } = result;
-
-      const nativeReports = reports.filter((r) => r.hasNativeCode);
-      const legacyReports = reports.filter((r) => r.status === "LEGACY_BRIDGE");
-      const readyReports = reports.filter((r) => r.status === "FULL_SUPPORT");
-      const untestedReports = reports.filter((r) => r.status === "UNKNOWN_NATIVE");
-      const pureJsReports = reports.filter((r) => r.status === "PURE_JS");
-      const page16KBIssues = reports.filter((r) => r.pageSize16KB && !r.pageSize16KB.isCompatible);
-
-      const totalNative = nativeReports.length;
-      const readyPercentage = totalNative > 0 ? Math.round((readyReports.length / totalNative) * 100) : 100;
-      const isFullyCompatible = legacyReports.length === 0 && page16KBIssues.length === 0;
+      const result = await scanProject({ projectRoot, deepScan: options.deep });
+      const summary = summarize(result.reports);
+      const failures = gateFailures(summary, failCategories);
 
       if (options.json) {
-        const output = {
-          project: {
-            name: projectName,
-            version: projectVersion,
-            reactNativeVersion,
-            reactVersion: reactVersion || null,
-            expoVersion: expoVersion || null,
-            path: projectRoot,
-            scanMode: options.deep ? "deep (transitive)" : "direct",
-          },
-          summary: {
-            totalScanned: reports.length,
-            nativePackages: totalNative,
-            ready: readyReports.length,
-            legacy: legacyReports.length,
-            untested: untestedReports.length,
-            pureJs: pureJsReports.length,
-            pageSize16KBIssues: page16KBIssues.length,
-            compatibilityScore: readyPercentage,
-            isCompatible: isFullyCompatible,
-          },
-          packages: reports,
-        };
-        console.log(JSON.stringify(output, null, 2));
+        console.log(
+          JSON.stringify(
+            {
+              project: {
+                name: result.project.name,
+                version: result.project.version,
+                reactNativeVersion: result.project.installedReactNative,
+                reactNativeDeclared: result.project.declaredReactNative,
+                reactVersion: result.project.installedReact,
+                expoVersion: result.project.installedExpo,
+                newArchEnabled: result.project.newArchEnabled,
+                archFlags: result.project.flags,
+                archNotes: result.project.notes,
+                path: projectRoot,
+                scanMode: result.scanMode,
+              },
+              summary,
+              adviceLastReviewed: ADVICE_LAST_REVIEWED,
+              failOn: failCategories,
+              failures,
+              packages: result.reports,
+            },
+            null,
+            2
+          )
+        );
       } else {
-        // Project Header Card
-        console.log("\n" + chalk.bold.cyan("┌" + "─".repeat(76) + "┐"));
+        printProjectHeader(result.project, projectRoot, result.scanMode);
+
+        const verdict = VERDICT_DISPLAY[summary.verdict];
+        console.log("\n" + chalk.bold("  New Architecture readiness:"));
         console.log(
-          chalk.bold.cyan("│") +
-          chalk.bold.white("  📦 Project:      ") +
-          chalk.bold.yellow(projectName) +
-          chalk.gray(` (v${projectVersion})`).padEnd(52) +
-          chalk.bold.cyan("│")
+          `  ${renderProgressBar(summary.compatibilityScore)}  ${verdict.render(verdict.text)}\n`
         );
-        console.log(
-          chalk.bold.cyan("│") +
-          chalk.bold.white("  ⚛️  React Native: ") +
-          chalk.bold.green(reactNativeVersion) +
-          (reactVersion ? chalk.gray(` | React: ${reactVersion}`) : "") +
-          (expoVersion ? chalk.magenta(` | Expo: ${expoVersion}`) : "").padEnd(45) +
-          chalk.bold.cyan("│")
-        );
-        console.log(
-          chalk.bold.cyan("│") +
-          chalk.bold.white("  📁 Path:         ") +
-          chalk.gray(projectRoot.length > 55 ? "..." + projectRoot.slice(-52) : projectRoot).padEnd(61) +
-          chalk.bold.cyan("│")
-        );
-        console.log(
-          chalk.bold.cyan("│") +
-          chalk.bold.white("  🔍 Scan Mode:    ") +
-          (options.deep ? chalk.magenta("Deep (Direct + Transitive)") : chalk.blue("Direct Dependencies Only")).padEnd(63) +
-          chalk.bold.cyan("│")
-        );
-        console.log(chalk.bold.cyan("└" + "─".repeat(76) + "┘\n"));
 
-        // Progress & Readiness Score
-        console.log(chalk.bold("  New Architecture Readiness:"));
-        console.log(`  ${renderProgressBar(readyPercentage)} ${isFullyCompatible ? chalk.green.bold("✔ FULLY COMPATIBLE") : chalk.red.bold("✖ MIGRATION REQUIRED")}\n`);
+        const displayed = options.all
+          ? result.reports
+          : result.reports.filter(
+              (report) => report.hasNativeCode || report.status === "UNRESOLVED"
+            );
 
-        // Render Table
-        const packagesToDisplay = options.all ? reports : nativeReports;
-
-        const table = new Table({
-          head: [
-            chalk.bold.white("Package & Version"),
-            chalk.bold.white("Type"),
-            chalk.bold.white("Platforms"),
-            chalk.bold.white("Status"),
-            chalk.bold.white("Tech Details"),
-            chalk.bold.white("Migration / Notes"),
-          ],
-          colWidths: [32, 12, 14, 16, 22, 36],
-          wordWrap: true,
-        });
-
-        for (const rep of packagesToDisplay) {
-          let statusText = "";
-          if (rep.status === "FULL_SUPPORT") {
-            statusText = chalk.green.bold("✔ Ready");
-          } else if (rep.status === "LEGACY_BRIDGE") {
-            statusText = chalk.red.bold("✖ Legacy");
-          } else if (rep.status === "PURE_JS") {
-            statusText = chalk.blue("○ Pure JS");
-          } else {
-            statusText = chalk.yellow("? Untested");
-          }
-
-          const platformBadges = rep.platforms.length > 0
-            ? rep.platforms.map((p) => chalk.cyan(`[${p}]`)).join(" ")
-            : chalk.gray("JS");
-
-          const techDetails = rep.notes.length > 0 ? rep.notes.join(", ") : "-";
-
-          let migrationAdvice = chalk.gray("-");
-          if (rep.pageSize16KB && !rep.pageSize16KB.isCompatible) {
-            const warningText = rep.pageSize16KB.warnings.join("\n");
-            migrationAdvice = `${chalk.red.bold("⚠️ 16KB Page Size Warning:")}\n${chalk.gray(warningText)}`;
-          } else if (rep.suggestion) {
-            migrationAdvice = `${chalk.yellow.bold("💡 " + rep.suggestion)}`;
-            if (rep.reason) {
-              migrationAdvice += `\n${chalk.gray(rep.reason)}`;
-            }
-          } else if (rep.status === "FULL_SUPPORT") {
-            migrationAdvice = chalk.green("✔ TurboModule / Fabric ready");
-          }
-
-          table.push([
-            `${chalk.bold(rep.name)}\n${chalk.gray("v" + rep.version)}`,
-            rep.isTransitive ? chalk.magenta("Transitive") : chalk.cyan("Direct"),
-            platformBadges,
-            statusText,
-            techDetails,
-            migrationAdvice,
-          ]);
+        if (displayed.length > 0) {
+          console.log(buildTable(displayed));
+        } else {
+          console.log(chalk.gray("  No native dependencies found."));
         }
 
-        console.log(table.toString());
+        printBreakdown(summary);
+        printActions(result.reports, summary);
 
-        // Breakdown Summary
-        console.log("\n" + chalk.bold("📊 Dependency Breakdown:"));
-        console.log(`  ${chalk.green("✔")} New Architecture Ready:   ${chalk.green.bold(readyReports.length)}`);
-        console.log(`  ${chalk.red("✖")} Legacy Bridge (Blocking):  ${chalk.red.bold(legacyReports.length)}`);
-        if (untestedReports.length > 0) {
-          console.log(`  ${chalk.yellow("?")} Untested Native Modules:   ${chalk.yellow.bold(untestedReports.length)}`);
-        }
-        console.log(`  ${chalk.blue("○")} Pure JS/TS Packages:       ${chalk.blue.bold(pureJsReports.length)}`);
-        console.log(`  📱 16KB Page Size (Android 15): ${page16KBIssues.length === 0 ? chalk.green.bold("✔ All Aligned") : chalk.red.bold(`✖ ${page16KBIssues.length} Warning(s)`)}`);
-        console.log(`  📦 Total Packages Scanned:      ${chalk.bold(reports.length)}`);
-
-        // Actionable Checklist for New Architecture
-        if (legacyReports.length > 0) {
-          console.log("\n" + chalk.red.bold("🚨 Action Required to Enable New Architecture:"));
-          legacyReports.forEach((pkg, index) => {
-            const advice = pkg.suggestion ? chalk.yellow(pkg.suggestion) : chalk.gray("Check library repo for New Arch / TurboModule release");
-            console.log(`  ${index + 1}. ${chalk.bold.white(pkg.name)}: ${advice}`);
-          });
-          console.log();
-        }
-
-        // Actionable Checklist for 16KB Page Size Issues
-        if (page16KBIssues.length > 0) {
-          console.log(chalk.red.bold("⚠️ 16KB Page Size Compatibility Issues (Google Play / Android 15):"));
-          page16KBIssues.forEach((pkg, index) => {
-            console.log(`  ${index + 1}. ${chalk.bold.white(pkg.name)}:`);
-            pkg.pageSize16KB?.warnings.forEach((w) => console.log(`     - ${chalk.yellow(w)}`));
-          });
-          console.log();
-        }
-
-        if (legacyReports.length === 0 && page16KBIssues.length === 0) {
-          console.log(chalk.green.bold("\n🚀 Congratulations! All native dependencies are ready for New Architecture, Bridgeless Mode & 16KB Android Page Sizes!\n"));
+        if (failures.length > 0) {
+          console.log(
+            chalk.red.bold(
+              `✖ Failing (--fail-on ${failCategories.join(",")}): ` +
+                failures.map((failure) => `${failure.count} ${failure.label}`).join(", ") +
+                "\n"
+            )
+          );
         }
       }
 
-      if (options.strict && (legacyReports.length > 0 || page16KBIssues.length > 0)) {
-        process.exit(1);
-      }
-    } catch (err: any) {
+      if (failures.length > 0) process.exit(1);
+    } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
       console.error(chalk.red(`\n✖ Error: ${message}`));
       process.exit(1);
@@ -216,4 +420,3 @@ program
   });
 
 program.parse(process.argv);
-
