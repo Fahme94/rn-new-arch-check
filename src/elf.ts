@@ -1,12 +1,16 @@
 import fs from "fs-extra";
 import path from "path";
 import fg from "fast-glob";
+import { open } from "node:fs/promises";
+import { readZipEntryPrefixes } from "./zip";
 
 export interface PrebuiltLibInfo {
   file: string;
   arch: string;
   is16KBAligned: boolean;
   maxAlign: number;
+  /** Set when the library was found inside an `.aar`/`.jar` archive. */
+  container?: string;
 }
 
 export interface PageSize16KBReport {
@@ -16,120 +20,228 @@ export interface PageSize16KBReport {
   warnings: string[];
 }
 
+/** Reads `length` bytes at `offset`. Returns fewer bytes near end-of-input. */
+export type ByteReader = (offset: number, length: number) => Promise<Buffer>;
+
+export type ElfParseResult =
+  | { kind: "ok"; info: PrebuiltLibInfo }
+  | { kind: "not-elf" }
+  | { kind: "truncated" };
+
+const ELF_HEADER_SIZE = 64;
+const PT_LOAD = 1;
+const REQUIRED_ALIGNMENT = 16384; // 0x4000
+
+/** Architectures on which Android's 16KB page size actually applies. */
+const SIXTEEN_KB_ARCHITECTURES = new Set(["arm64-v8a", "x86_64"]);
+
+const MACHINE_NAMES: Record<number, string> = {
+  183: "arm64-v8a",
+  62: "x86_64",
+  40: "armeabi-v7a",
+  3: "x86",
+};
+
+function archFromPath(candidate: string): string {
+  const lower = candidate.toLowerCase();
+  if (lower.includes("arm64-v8a")) return "arm64-v8a";
+  if (lower.includes("x86_64")) return "x86_64";
+  if (lower.includes("armeabi-v7a")) return "armeabi-v7a";
+  if (lower.includes("x86")) return "x86";
+  return "unknown";
+}
+
 /**
- * Checks an ELF (.so) file for 16KB (0x4000) segment alignment.
- * Android 15 16KB page sizes apply to 64-bit architectures (arm64-v8a, x86_64).
+ * Parse ELF segment alignment through a byte reader.
+ *
+ * Only the 64-byte header and the program header table are read. Previously the
+ * whole shared library was loaded into memory to inspect ~120 bytes of it, which
+ * cost 182MB of resident memory for a single 120MB library.
  */
-export async function checkElf16KBAlignment(filePath: string): Promise<PrebuiltLibInfo | null> {
-  try {
-    const buffer = await fs.readFile(filePath);
-    if (buffer.length < 64) return null;
+export async function parseElfAlignment(
+  read: ByteReader,
+  label: string,
+  archHint: string
+): Promise<ElfParseResult> {
+  const header = await read(0, ELF_HEADER_SIZE);
+  if (header.length < ELF_HEADER_SIZE) return { kind: "not-elf" };
 
-    // Check ELF magic: 0x7F, 'E', 'L', 'F'
-    if (buffer[0] !== 0x7f || buffer[1] !== 0x45 || buffer[2] !== 0x4c || buffer[3] !== 0x46) {
-      return null;
-    }
+  if (header[0] !== 0x7f || header[1] !== 0x45 || header[2] !== 0x4c || header[3] !== 0x46) {
+    return { kind: "not-elf" };
+  }
 
-    const is64Bit = buffer[4] === 2; // 1 = 32-bit, 2 = 64-bit
-    const isLittleEndian = buffer[5] === 1;
+  const is64Bit = header[4] === 2;
+  const isLittleEndian = header[5] === 1;
 
-    // We focus on 64-bit binaries as 16KB page size kernels run 64-bit binaries
-    const archCode = isLittleEndian ? buffer.readUInt16LE(18) : buffer.readUInt16BE(18);
-    let arch = "unknown";
-    if (archCode === 183) arch = "arm64-v8a";
-    else if (archCode === 62) arch = "x86_64";
-    else if (archCode === 40) arch = "armeabi-v7a";
-    else if (archCode === 3) arch = "x86";
+  const machine = isLittleEndian ? header.readUInt16LE(18) : header.readUInt16BE(18);
+  let arch = MACHINE_NAMES[machine] ?? "unknown";
+  if (arch === "unknown") arch = archFromPath(archHint);
 
-    // Detect arch from folder if unknown
-    if (arch === "unknown") {
-      const lower = filePath.toLowerCase();
-      if (lower.includes("arm64-v8a")) arch = "arm64-v8a";
-      else if (lower.includes("x86_64")) arch = "x86_64";
-      else if (lower.includes("armeabi-v7a")) arch = "armeabi-v7a";
-      else if (lower.includes("x86")) arch = "x86";
-    }
-
-    if (!is64Bit) {
-      // 32-bit binaries don't run on 16KB page size systems or are legacy
-      return {
-        file: path.basename(filePath),
-        arch,
-        is16KBAligned: true,
-        maxAlign: 4096,
-      };
-    }
-
-    if (!isLittleEndian) return null;
-
-    const e_phoff = Number(buffer.readBigUInt64LE(32));
-    const e_phentsize = buffer.readUInt16LE(54);
-    const e_phnum = buffer.readUInt16LE(56);
-
-    let maxAlign = 0;
-    let hasLoadSegment = false;
-    let is16KBAligned = true;
-
-    for (let i = 0; i < e_phnum; i++) {
-      const entryOffset = e_phoff + i * e_phentsize;
-      if (entryOffset + 56 > buffer.length) break;
-
-      const p_type = buffer.readUInt32LE(entryOffset);
-      // PT_LOAD = 1
-      if (p_type === 1) {
-        hasLoadSegment = true;
-        const p_align = Number(buffer.readBigUInt64LE(entryOffset + 48));
-        if (p_align > maxAlign) {
-          maxAlign = p_align;
-        }
-        // If segment alignment is less than 16KB (16384 / 0x4000)
-        if (p_align < 16384) {
-          is16KBAligned = false;
-        }
-      }
-    }
-
+  // 16KB page size only applies to 64-bit devices, so 32-bit libraries are
+  // reported as compliant rather than as findings the developer cannot act on.
+  if (!is64Bit) {
     return {
-      file: path.basename(filePath),
+      kind: "ok",
+      info: { file: label, arch, is16KBAligned: true, maxAlign: 4096 },
+    };
+  }
+
+  if (!isLittleEndian) return { kind: "not-elf" };
+
+  const phOffset = Number(header.readBigUInt64LE(32));
+  const phEntrySize = header.readUInt16LE(54);
+  const phCount = header.readUInt16LE(56);
+
+  // Guard against a corrupt or hostile header driving a huge allocation.
+  if (phEntrySize < 56 || phEntrySize > 1024 || phCount === 0 || phCount > 65535) {
+    return { kind: "not-elf" };
+  }
+
+  const tableSize = phEntrySize * phCount;
+  const table = await read(phOffset, tableSize);
+  if (table.length < tableSize) return { kind: "truncated" };
+
+  let maxAlign = 0;
+  let hasLoadSegment = false;
+  let is16KBAligned = true;
+
+  for (let i = 0; i < phCount; i++) {
+    const entry = i * phEntrySize;
+    if (table.readUInt32LE(entry) !== PT_LOAD) continue;
+
+    hasLoadSegment = true;
+    const align = Number(table.readBigUInt64LE(entry + 48));
+    if (align > maxAlign) maxAlign = align;
+    if (align < REQUIRED_ALIGNMENT) is16KBAligned = false;
+  }
+
+  return {
+    kind: "ok",
+    info: {
+      file: label,
       arch,
       is16KBAligned: hasLoadSegment ? is16KBAligned : true,
       maxAlign,
-    };
+    },
+  };
+}
+
+function bufferReader(bytes: Buffer): ByteReader {
+  return async (offset, length) => bytes.subarray(offset, offset + length);
+}
+
+/** Inspect a shared library on disk, reading only its headers. */
+export async function checkElfFile(filePath: string): Promise<ElfParseResult> {
+  let handle;
+  try {
+    handle = await open(filePath, "r");
   } catch {
-    return null;
+    return { kind: "not-elf" };
+  }
+
+  try {
+    const read: ByteReader = async (offset, length) => {
+      const buffer = Buffer.alloc(length);
+      const { bytesRead } = await handle!.read(buffer, 0, length, offset);
+      return buffer.subarray(0, bytesRead);
+    };
+    return await parseElfAlignment(read, path.basename(filePath), filePath);
+  } catch {
+    return { kind: "not-elf" };
+  } finally {
+    await handle.close().catch(() => undefined);
   }
 }
 
 /**
- * Checks a package directory for 16KB page size compatibility issues.
+ * Back-compatible wrapper returning `null` for anything that is not a readable
+ * ELF file.
  */
+export async function checkElf16KBAlignment(filePath: string): Promise<PrebuiltLibInfo | null> {
+  const result = await checkElfFile(filePath);
+  return result.kind === "ok" ? result.info : null;
+}
+
+/**
+ * Bytes read per archive entry. An ELF header plus program header table sits at
+ * the very start of the file; 64KB covers it with a wide margin.
+ */
+const ARCHIVE_PREFIX_BYTES = 64 * 1024;
+
+const SCAN_IGNORE = [
+  "**/node_modules/**",
+  "**/example/**",
+  "**/examples/**",
+  "**/build/**",
+  "**/android/build/**",
+];
+
+function alignmentWarning(info: PrebuiltLibInfo): string | null {
+  if (info.is16KBAligned) return null;
+  if (!SIXTEEN_KB_ARCHITECTURES.has(info.arch)) return null;
+
+  const where = info.container ? `${info.container} -> ${info.file}` : info.file;
+  return `Prebuilt binary ${where} (${info.arch}) has ${info.maxAlign}B alignment, requires ${REQUIRED_ALIGNMENT}B (16KB).`;
+}
+
+/** Checks a package directory for Android 16KB page size compatibility. */
 export async function checkPackage16KB(pkgDir: string): Promise<PageSize16KBReport> {
   const warnings: string[] = [];
   const prebuiltLibs: PrebuiltLibInfo[] = [];
 
-  // Find all prebuilt .so and .aar files
-  const soFiles = await fg(["**/*.so"], {
-    cwd: pkgDir,
-    ignore: ["**/node_modules/**", "**/example/**", "**/examples/**", "**/build/**", "**/android/build/**"],
-    absolute: true,
-  });
+  const [soFiles, archives, cppFiles] = await Promise.all([
+    fg(["**/*.so"], { cwd: pkgDir, ignore: SCAN_IGNORE, absolute: true }),
+    fg(["**/*.{aar,jar}"], { cwd: pkgDir, ignore: SCAN_IGNORE, absolute: true }),
+    fg(["**/*.{cpp,c,cc,h,hpp}"], {
+      cwd: pkgDir,
+      ignore: ["**/node_modules/**", "**/example/**", "**/examples/**", "**/build/**"],
+      absolute: true,
+    }),
+  ]);
 
   for (const soPath of soFiles) {
-    const elfInfo = await checkElf16KBAlignment(soPath);
-    if (elfInfo) {
-      prebuiltLibs.push(elfInfo);
-      if (!elfInfo.is16KBAligned && (elfInfo.arch === "arm64-v8a" || elfInfo.arch === "x86_64")) {
-        warnings.push(`Prebuilt binary ${elfInfo.file} (${elfInfo.arch}) has 4KB alignment (${elfInfo.maxAlign}B), requires 16KB (16384B).`);
-      }
-    }
+    const result = await checkElfFile(soPath);
+    if (result.kind !== "ok") continue;
+    prebuiltLibs.push(result.info);
+    const warning = alignmentWarning(result.info);
+    if (warning) warnings.push(warning);
   }
 
-  // Scan C/C++ source code for hardcoded 4KB page size assumptions
-  const cppFiles = await fg(["**/*.{cpp,c,cc,h,hpp}"], {
-    cwd: pkgDir,
-    ignore: ["**/node_modules/**", "**/example/**", "**/examples/**", "**/build/**"],
-    absolute: true,
-  });
+  for (const archivePath of archives) {
+    const container = path.basename(archivePath);
+    let entries;
+    try {
+      entries = await readZipEntryPrefixes(
+        archivePath,
+        (name) => name.toLowerCase().endsWith(".so"),
+        ARCHIVE_PREFIX_BYTES
+      );
+    } catch {
+      // An unreadable archive is not evidence of misalignment.
+      continue;
+    }
+
+    for (const entry of entries) {
+      const result = await parseElfAlignment(
+        bufferReader(entry.bytes),
+        entry.name,
+        entry.name
+      );
+
+      if (result.kind === "truncated") {
+        warnings.push(
+          `Could not read program headers of ${container} -> ${entry.name}; alignment unverified.`
+        );
+        continue;
+      }
+      if (result.kind !== "ok") continue;
+
+      const info = { ...result.info, container };
+      prebuiltLibs.push(info);
+      const warning = alignmentWarning(info);
+      if (warning) warnings.push(warning);
+    }
+  }
 
   for (const cppPath of cppFiles) {
     try {
@@ -146,10 +258,8 @@ export async function checkPackage16KB(pkgDir: string): Promise<PageSize16KBRepo
     }
   }
 
-  const isCompatible = warnings.length === 0;
-
   return {
-    isCompatible,
+    isCompatible: warnings.length === 0,
     hasPrebuiltBinaries: prebuiltLibs.length > 0,
     prebuiltLibs,
     warnings,

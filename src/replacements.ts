@@ -1,301 +1,424 @@
-export interface ReplacementInfo {
-  replacement: string;
+import { satisfiesMinimum } from "./version";
+
+/**
+ * Curated migration advice.
+ *
+ * Each entry declares what *kind* of action it represents, so the renderer can
+ * tell "replace this package" apart from "you are already fine". Previously a
+ * single prose field carried all three meanings and every entry was rendered as
+ * a warning, which flagged test runners and already-compliant packages as
+ * problems.
+ *
+ * `upgrade` entries carry a `minVersion` floor that is compared against the
+ * *installed* version, so advice disappears once it has been acted on. Treating
+ * the number as a floor rather than a target is also what keeps this table from
+ * rotting: a project several majors past the floor is simply silent, instead of
+ * being told to upgrade to a version it passed long ago.
+ */
+export type AdviceKind = "replace" | "upgrade" | "none";
+
+export interface AdviceEntry {
+  kind: AdviceKind;
+  /** Lowest version with New Architecture support. Only for `upgrade`. */
+  minVersion?: string;
+  /** What to migrate to. Only for `replace`. */
+  replacement?: string;
   reason: string;
 }
 
-export const REPLACEMENTS_DB: Record<string, ReplacementInfo> = {
+export interface Advice extends AdviceEntry {
+  package: string;
+  /** True when an `upgrade` floor is already met, or the entry is `none`. */
+  satisfied: boolean;
+}
+
+/**
+ * Date this table was last checked against upstream releases. Surfaced in the
+ * report so a stale table is visible rather than silently trusted.
+ */
+export const ADVICE_LAST_REVIEWED = "2026-09-07";
+
+export const EXACT_ADVICE: Record<string, AdviceEntry> = {
   // --- CAMERA & MEDIA ---
   "react-native-camera": {
+    kind: "replace",
     replacement: "react-native-vision-camera / expo-camera",
-    reason: "Deprecated; crashes in Bridgeless mode.",
+    reason: "Deprecated and unmaintained; superseded by vision-camera.",
   },
   "react-native-image-picker": {
-    replacement: "react-native-image-picker (v7+) / expo-image-picker",
-    reason: "Ensure v7+ for full TurboModule & Fabric support.",
+    kind: "upgrade",
+    minVersion: "7.0.0",
+    reason: "v7+ ships Codegen specs for TurboModules.",
   },
   "react-native-image-crop-picker": {
-    replacement: "react-native-image-crop-picker (v0.51+) / expo-image-picker",
-    reason: "v0.51+ includes Codegen specs for New Architecture.",
+    kind: "upgrade",
+    minVersion: "0.51.0",
+    reason: "v0.51+ includes Codegen specs for the New Architecture.",
   },
   "react-native-image-resizer": {
+    kind: "replace",
     replacement: "@bam.tech/react-native-image-resizer / expo-image-manipulator",
-    reason: "The original package is unmaintained on New Arch.",
+    reason: "The original package is unmaintained; the fork is the maintained line.",
   },
   "react-native-video": {
-    replacement: "react-native-video (v6+) / expo-video",
-    reason: "Ensure using v6+ for full New Architecture Fabric/TurboModule support.",
+    kind: "upgrade",
+    minVersion: "6.0.0",
+    reason: "v6+ provides Fabric and TurboModule implementations.",
   },
   "react-native-sound": {
-    replacement: "expo-av / react-native-sound-player / react-native-track-player",
-    reason: "Unmaintained library; does not implement TurboModule specs.",
+    kind: "replace",
+    replacement: "expo-audio / react-native-track-player",
+    reason: "Unmaintained; no TurboModule implementation.",
   },
   "react-native-sound-player": {
-    replacement: "expo-av / react-native-track-player",
-    reason: "Legacy bridge audio player.",
+    kind: "replace",
+    replacement: "expo-audio / react-native-track-player",
+    reason: "Legacy bridge audio player with no Codegen specs.",
   },
   "react-native-audio-recorder-player": {
-    replacement: "expo-av / react-native-sound-player",
-    reason: "Uses legacy bridge event emitters; consider Expo AV or modern audio libraries.",
+    kind: "replace",
+    replacement: "expo-audio / react-native-track-player",
+    reason: "Legacy bridge event emitters; no TurboModule implementation.",
   },
   "react-native-track-player": {
-    replacement: "react-native-track-player (v4+)",
-    reason: "v4+ supports TurboModules and modern React Native architecture.",
+    kind: "upgrade",
+    minVersion: "4.0.0",
+    reason: "v4+ supports TurboModules.",
   },
   "react-native-tts": {
-    replacement: "expo-speech / react-native-tts (v4+)",
-    reason: "Legacy TTS bridge; expo-speech provides full cross-platform compatibility.",
+    kind: "upgrade",
+    minVersion: "4.0.0",
+    reason: "v4+ adds New Architecture support; expo-speech is an alternative.",
   },
   "@react-native-voice/voice": {
-    replacement: "@react-native-voice/voice (v3.2+) / expo-speech",
-    reason: "Ensure using v3.2+ for New Architecture support.",
+    kind: "upgrade",
+    minVersion: "3.2.0",
+    reason: "v3.2+ adds New Architecture support.",
   },
   "react-native-pdf": {
-    replacement: "react-native-pdf (v6.7+) / expo-document-picker",
-    reason: "Ensure v6.7+ with Fabric view support.",
+    kind: "upgrade",
+    minVersion: "6.7.0",
+    reason: "v6.7+ adds Fabric view support.",
   },
 
   // --- STORAGE & DATABASE ---
   "@react-native-community/async-storage": {
-    replacement: "react-native-mmkv / @react-native-async-storage/async-storage",
-    reason: "Deprecated namespace; migrate to MMKV (JSI) for best performance.",
+    kind: "replace",
+    replacement: "@react-native-async-storage/async-storage / react-native-mmkv",
+    reason: "Deprecated namespace; the package moved to a new scope.",
   },
   "react-native-sqlite-storage": {
+    kind: "replace",
     replacement: "op-sqlite / expo-sqlite",
-    reason: "Old native bridge; op-sqlite and expo-sqlite offer native JSI bindings.",
+    reason: "Legacy bridge; op-sqlite and expo-sqlite use native JSI bindings.",
   },
-  "realm": {
-    replacement: "realm (v12+)",
-    reason: "Realm v12+ is built directly with native C++ JSI bindings.",
+  realm: {
+    kind: "upgrade",
+    minVersion: "12.0.0",
+    reason: "v12+ is built on native C++ JSI bindings.",
   },
   "@nozbe/watermelondb": {
-    replacement: "@nozbe/watermelondb (v0.27+)",
-    reason: "Ensure v0.27+ with JSI SQLite adapter enabled.",
+    kind: "upgrade",
+    minVersion: "0.27.0",
+    reason: "v0.27+ ships the JSI SQLite adapter.",
   },
   "@react-native-cookies/cookies": {
-    replacement: "@react-native-cookies/cookies (v6+)",
+    kind: "upgrade",
+    minVersion: "6.0.0",
     reason: "v6+ includes TurboModule specs.",
   },
   "react-native-keychain": {
-    replacement: "react-native-keychain (v10+) / expo-secure-store",
-    reason: "v10+ provides full Codegen and TurboModule support.",
+    kind: "upgrade",
+    minVersion: "10.0.0",
+    reason: "v10+ provides Codegen and TurboModule support.",
   },
 
   // --- FILE SYSTEM ---
   "react-native-fs": {
+    kind: "replace",
     replacement: "@dr.pogodin/react-native-fs / expo-file-system",
-    reason: "The original react-native-fs is unmaintained on New Arch.",
+    reason: "The original package is unmaintained; the fork is the maintained line.",
   },
   "react-native-fetch-blob": {
+    kind: "replace",
     replacement: "react-native-blob-util / expo-file-system",
-    reason: "Deprecated and unmaintained; migrate to react-native-blob-util.",
+    reason: "Deprecated and unmaintained.",
   },
   "react-native-zip-archive": {
-    replacement: "react-native-zip-archive (v7+) / expo-file-system",
-    reason: "v7+ supports New Architecture.",
+    kind: "upgrade",
+    minVersion: "7.0.0",
+    reason: "v7+ supports the New Architecture.",
   },
 
   // --- NOTIFICATIONS & MESSAGING ---
   "react-native-push-notification": {
+    kind: "replace",
     replacement: "expo-notifications / @notifee/react-native",
-    reason: "Unmaintained; incompatible with New Architecture & Bridgeless mode.",
+    reason: "Unmaintained; no TurboModule implementation.",
   },
   "@notifee/react-native": {
-    replacement: "expo-notifications / check latest Notifee release",
-    reason: "Legacy event bridge emitter; check latest releases for New Arch support.",
+    kind: "replace",
+    replacement: "expo-notifications",
+    reason: "Legacy bridge event emitters; check Notifee releases for New Arch status.",
   },
 
   // --- DEVICE, SENSORS & SYSTEM ---
   "react-native-device-info": {
-    replacement: "expo-device / react-native-device-info (v14+)",
-    reason: "Synchronous legacy bridge methods; use expo-device or async getters.",
+    kind: "upgrade",
+    minVersion: "14.0.0",
+    reason: "v14+ adds TurboModule support; expo-device is an alternative.",
   },
   "react-native-get-location": {
+    kind: "replace",
     replacement: "expo-location / react-native-geolocation-service",
-    reason: "Legacy bridge location listener; migrate to modern location API.",
+    reason: "Legacy bridge location listener.",
   },
   "react-native-geolocation-service": {
-    replacement: "expo-location / react-native-geolocation-service (v5.3+)",
+    kind: "upgrade",
+    minVersion: "5.3.0",
     reason: "v5.3+ supports TurboModules.",
   },
   "react-native-orientation": {
+    kind: "replace",
     replacement: "react-native-orientation-locker / expo-screen-orientation",
-    reason: "Unmaintained; replace with orientation-locker or expo-screen-orientation.",
+    reason: "Unmaintained.",
   },
   "react-native-orientation-locker": {
+    kind: "replace",
     replacement: "expo-screen-orientation",
     reason: "Legacy bridge orientation listener.",
   },
   "react-native-sensors": {
+    kind: "replace",
     replacement: "expo-sensors",
-    reason: "Legacy event bridge; expo-sensors has full modern architecture support.",
+    reason: "Legacy bridge event emitters.",
   },
   "react-native-haptic-feedback": {
-    replacement: "expo-haptics / react-native-haptic-feedback (v2+)",
-    reason: "expo-haptics or v2+ provides TurboModule support.",
+    kind: "upgrade",
+    minVersion: "2.0.0",
+    reason: "v2+ adds TurboModule support; expo-haptics is an alternative.",
   },
   "react-native-contacts": {
-    replacement: "expo-contacts / react-native-contacts (v7+)",
-    reason: "Ensure v7+ for modern architecture compatibility.",
+    kind: "upgrade",
+    minVersion: "7.0.0",
+    reason: "v7+ adds New Architecture support.",
   },
   "react-native-ble-plx": {
-    replacement: "react-native-ble-plx (v3+)",
-    reason: "Ensure v3+ with TurboModule support.",
+    kind: "upgrade",
+    minVersion: "3.0.0",
+    reason: "v3+ adds TurboModule support.",
   },
   "react-native-ble-manager": {
-    replacement: "react-native-ble-manager (v11+) / react-native-ble-plx",
-    reason: "Ensure v11+ for New Architecture support.",
+    kind: "upgrade",
+    minVersion: "11.0.0",
+    reason: "v11+ adds New Architecture support.",
   },
   "react-native-nfc-manager": {
-    replacement: "react-native-nfc-manager (v3.14+)",
-    reason: "v3.14+ includes TurboModule compatibility.",
+    kind: "upgrade",
+    minVersion: "3.14.0",
+    reason: "v3.14+ adds TurboModule compatibility.",
   },
   "react-native-torch": {
+    kind: "replace",
     replacement: "expo-camera / react-native-vision-camera",
     reason: "Legacy bridge torch module.",
   },
   "react-native-network-info": {
+    kind: "replace",
     replacement: "@react-native-community/netinfo / expo-network",
-    reason: "Migrate to @react-native-community/netinfo (v11+).",
+    reason: "Superseded by @react-native-community/netinfo.",
   },
   "react-native-battery": {
+    kind: "replace",
     replacement: "expo-battery / expo-device",
-    reason: "Legacy battery bridge.",
+    reason: "Legacy bridge battery module.",
   },
   "react-native-background-timer": {
+    kind: "replace",
     replacement: "react-native-background-actions / expo-task-manager",
-    reason: "Uses legacy background bridge timers.",
+    reason: "Legacy bridge background timers.",
   },
 
   // --- UI, ANIMATION & STYLING ---
   "react-native-fast-image": {
+    kind: "replace",
     replacement: "expo-image / @d11/react-native-fast-image",
-    reason: "Original fast-image is unmaintained; use expo-image or @d11/react-native-fast-image.",
+    reason: "The original package is unmaintained; the fork is the maintained line.",
   },
   "react-native-linear-gradient": {
+    kind: "replace",
     replacement: "expo-linear-gradient / @shopify/react-native-skia",
-    reason: "Lacks native Fabric component descriptors in older builds.",
+    reason: "Older releases have no Fabric component descriptors.",
   },
   "react-native-blur": {
-    replacement: "@react-native-community/blur (v4.4+) / @shopify/react-native-skia",
-    reason: "Older versions lack Fabric view descriptors.",
+    kind: "replace",
+    replacement: "@react-native-community/blur / @shopify/react-native-skia",
+    reason: "Moved to the community scope; older releases lack Fabric descriptors.",
   },
   "react-native-snackbar": {
+    kind: "replace",
     replacement: "react-native-toast-message / react-native-paper",
-    reason: "Legacy bridge snackbar; JS toast message provides better cross-platform support.",
+    reason: "Legacy bridge module; a JS implementation avoids native code entirely.",
   },
   "react-native-simple-toast": {
-    replacement: "react-native-toast-message / expo-notifications",
-    reason: "Pure JS toast libraries avoid native bridge overhead.",
+    kind: "replace",
+    replacement: "react-native-toast-message",
+    reason: "Legacy bridge module; a JS implementation avoids native code entirely.",
   },
   "react-native-snap-carousel": {
+    kind: "replace",
     replacement: "react-native-reanimated-carousel",
-    reason: "Unmaintained; reanimated-carousel offers high performance with Fabric.",
+    reason: "Unmaintained.",
   },
   "react-native-swiper": {
+    kind: "replace",
     replacement: "react-native-pager-view / react-native-reanimated-carousel",
-    reason: "Unmaintained legacy swiper component.",
+    reason: "Unmaintained.",
   },
   "react-native-vector-icons": {
-    replacement: "@expo/vector-icons / react-native-vector-icons (v10+)",
-    reason: "Ensure v10+ for New Architecture support.",
+    kind: "upgrade",
+    minVersion: "10.0.0",
+    reason: "v10+ adds New Architecture support.",
   },
   "lottie-react-native": {
-    replacement: "lottie-react-native (v7+)",
-    reason: "v7+ supports Fabric & TurboModules.",
+    kind: "upgrade",
+    minVersion: "7.0.0",
+    reason: "v7+ supports Fabric and TurboModules.",
   },
   "react-native-maps": {
-    replacement: "react-native-maps (v1.20+) / @rnmapbox/maps",
-    reason: "Upgrade to v1.20+ with Fabric support or enable Interop layer.",
+    kind: "upgrade",
+    minVersion: "1.20.0",
+    reason: "v1.20+ adds Fabric support.",
   },
   "react-native-splash-screen": {
-    replacement: "react-native-bootsplash (v6+) / expo-splash-screen",
-    reason: "react-native-splash-screen is unmaintained and incompatible with New Arch.",
+    kind: "replace",
+    replacement: "react-native-bootsplash / expo-splash-screen",
+    reason: "Unmaintained; no New Architecture support.",
   },
   "react-native-bootsplash": {
-    replacement: "react-native-bootsplash (v6+)",
-    reason: "Ensure v6+ for full New Architecture & Fabric support.",
+    kind: "upgrade",
+    minVersion: "6.0.0",
+    reason: "v6+ adds full New Architecture and Fabric support.",
   },
 
   // --- APP UPDATES, IN-APP PURCHASES & AUTH ---
   "react-native-version-check": {
-    replacement: "react-native-version-check-expo / pure JS lookup",
-    reason: "Relies on legacy bridge for device info; easy to replace with JS fetch.",
+    kind: "replace",
+    replacement: "expo-application / a plain JS registry lookup",
+    reason: "Legacy bridge device info; trivially replaced in JS.",
   },
   "react-native-code-push": {
-    replacement: "expo-updates / react-native-code-push (v8.2+)",
-    reason: "Ensure v8.2+ or migrate to modern OTA updates.",
+    kind: "upgrade",
+    minVersion: "8.2.0",
+    reason: "v8.2+ supports the New Architecture; expo-updates is an alternative.",
   },
   "react-native-iap": {
-    replacement: "react-native-iap (v12+) / react-native-purchases (RevenueCat)",
+    kind: "upgrade",
+    minVersion: "12.0.0",
     reason: "v12+ supports TurboModules.",
   },
   "react-native-in-app-review": {
-    replacement: "expo-store-review / react-native-in-app-review (v4+)",
+    kind: "upgrade",
+    minVersion: "4.0.0",
     reason: "v4+ includes TurboModule specs.",
   },
   "react-native-app-auth": {
-    replacement: "expo-auth-session / react-native-app-auth (v7+)",
-    reason: "v7+ supports modern React Native architectures.",
+    kind: "upgrade",
+    minVersion: "7.0.0",
+    reason: "v7+ supports the New Architecture.",
   },
   "react-native-config": {
-    replacement: "react-native-config (v1.5.3+) / expo-constants",
-    reason: "Ensure using v1.5.3+ which supports TurboModules & Codegen.",
+    kind: "upgrade",
+    minVersion: "1.5.3",
+    reason: "v1.5.3+ supports TurboModules and Codegen.",
   },
   "react-native-google-mobile-ads": {
-    replacement: "react-native-google-mobile-ads (v14+)",
-    reason: "v14+ supports New Architecture & TurboModules.",
+    kind: "upgrade",
+    minVersion: "14.0.0",
+    reason: "v14+ supports the New Architecture and TurboModules.",
   },
 
   // --- THIRD-PARTY SDKs ---
   "@zoom/meetingsdk-react-native": {
-    replacement: "Check Zoom SDK changelog / Interop layer",
-    reason: "Heavyweight native SDK requiring legacy bridge or Interop layer.",
+    kind: "none",
+    reason:
+      "Heavyweight native SDK with no Codegen specs; runs through the interop layer. Check the Zoom changelog for a native New Arch release.",
   },
   "posthog-react-native-session-replay": {
-    replacement: "posthog-react-native (v3+) / check posthog docs",
-    reason: "Update to latest PostHog React Native SDK.",
+    kind: "replace",
+    replacement: "posthog-react-native",
+    reason: "Session replay moved into the main PostHog React Native SDK.",
   },
   "@segment/analytics-react-native": {
-    replacement: "@segment/analytics-react-native (v2.18+)",
+    kind: "upgrade",
+    minVersion: "2.18.0",
     reason: "v2.18+ includes TurboModule support.",
   },
+  "@sentry/react-native": {
+    kind: "upgrade",
+    minVersion: "6.0.0",
+    reason: "v6+ includes Codegen and TurboModule support.",
+  },
 
-  // --- TOOLING & UTILITIES (Non-blocking) ---
-  "detox": {
-    replacement: "None needed (Test Runner)",
-    reason: "E2E testing tool; does not affect app runtime New Arch compatibility.",
+  // --- TOOLING & UTILITIES (no action needed) ---
+  detox: {
+    kind: "none",
+    reason: "End-to-end test runner; does not affect app runtime architecture.",
   },
   "react-native-qrcode-svg": {
-    replacement: "None needed (Ready via react-native-svg)",
-    reason: "Pure JS SVG wrapper; compatibility depends on react-native-svg.",
+    kind: "none",
+    reason: "Pure JS SVG wrapper; compatibility follows react-native-svg.",
   },
   "expo-updates": {
-    replacement: "Compatible on Expo SDK 51+",
-    reason: "OTA updates module; supports New Arch on modern Expo SDK.",
+    kind: "none",
+    reason: "Supports the New Architecture on modern Expo SDKs.",
   },
 };
 
-export function getSuggestion(pkgName: string): ReplacementInfo | undefined {
-  if (REPLACEMENTS_DB[pkgName]) {
-    return REPLACEMENTS_DB[pkgName];
-  }
+export const PREFIX_ADVICE: { prefix: string; entry: AdviceEntry }[] = [
+  {
+    prefix: "@react-native-firebase/",
+    entry: {
+      kind: "upgrade",
+      minVersion: "21.6.0",
+      reason: "New Architecture support landed in v21.6.",
+    },
+  },
+];
 
-  // Handle Firebase modules
-  if (pkgName.startsWith("@react-native-firebase/")) {
-    return {
-      replacement: "Upgrade @react-native-firebase to v21.6+ or v22+",
-      reason: "New Architecture support is included in recent RN Firebase releases.",
-    };
-  }
+function lookup(pkgName: string): AdviceEntry | undefined {
+  const exact = EXACT_ADVICE[pkgName];
+  if (exact) return exact;
 
-  // Handle Sentry
-  if (pkgName === "@sentry/react-native") {
-    return {
-      replacement: "@sentry/react-native (v6+)",
-      reason: "v6+ includes Codegen and TurboModule support.",
-    };
+  for (const rule of PREFIX_ADVICE) {
+    if (pkgName.startsWith(rule.prefix)) return rule.entry;
   }
 
   return undefined;
 }
 
+/**
+ * Resolve advice for a package against its installed version.
+ *
+ * `satisfied` advice is still returned so machine-readable output can show that
+ * the check ran; the human report suppresses it.
+ */
+export function getAdvice(pkgName: string, installedVersion?: string | null): Advice | undefined {
+  const entry = lookup(pkgName);
+  if (!entry) return undefined;
+
+  const satisfied =
+    entry.kind === "none" ||
+    (entry.kind === "upgrade" &&
+      entry.minVersion !== undefined &&
+      satisfiesMinimum(installedVersion, entry.minVersion));
+
+  return { ...entry, package: pkgName, satisfied };
+}
+
+/** One-line summary for display. */
+export function formatAdvice(advice: Advice): string {
+  if (advice.kind === "replace") return `Replace with ${advice.replacement}`;
+  if (advice.kind === "upgrade") return `Upgrade to v${advice.minVersion} or later`;
+  return "No action needed";
+}
